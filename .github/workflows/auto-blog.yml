@@ -31,4 +31,4 @@ jobs:
           TISTORY_ACCESS_TOKEN: ${{ secrets.TISTORY_ACCESS_TOKEN }}
           TISTORY_BLOG_NAME: ${{ secrets.TISTORY_BLOG_NAME }}
         run: |
-          python main.py --limit 1
+          python main.py --once --limit 1
