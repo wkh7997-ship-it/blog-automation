@@ -1,12 +1,7 @@
 #!/usr/bin/env python3
-"""해외 여행지 블로그 포스팅 자동화 (AI 키워드 자동 생성 버전)
+"""해외 여행지 블로그 포스팅 자동화 (AI 키워드 자동 생성 + Playwright 웹 자동화 발행)
 
-Claude(키워드 자동 생성 + 포스팅 작성) → Pixabay(이미지) → posts/*.md 저장 → 티스토리 발행
-
-사용법 (로컬 테스트 시):
-    python main.py             # 상시 대기하며 스케줄에 따라 실행
-    python main.py --once      # 1회만 즉시 실행 후 종료
-    python main.py --no-publish    # 마크다운만 저장 (티스토리 발행 생략)
+Claude(키워드 자동 생성 + 포스팅 작성) → Pixabay(이미지) → posts/*.md 저장 → Playwright 티스토리 자동 발행
 """
 from __future__ import annotations
 
@@ -14,7 +9,6 @@ import argparse
 import html
 import json
 import logging
-import mimetypes
 import os
 import re
 import sys
@@ -28,6 +22,7 @@ import anthropic
 import requests
 from dotenv import load_dotenv
 import schedule
+from playwright.sync_api import sync_playwright
 
 # ──────────────────────────────────────────────────────────────
 # 상수
@@ -37,10 +32,7 @@ POSTS_DIR = BASE_DIR / "posts"
 IMAGES_DIR = BASE_DIR / "images"
 
 DEFAULT_MODEL = "claude-sonnet-5-5"
-
 PIXABAY_API_URL = "https://pixabay.com/api/"
-TISTORY_WRITE_URL = "https://www.tistory.com/apis/post/write"
-TISTORY_ATTACH_URL = "https://www.tistory.com/apis/post/attach"
 HTTP_TIMEOUT = 30
 
 log = logging.getLogger("travel-blog")
@@ -53,11 +45,10 @@ log = logging.getLogger("travel-blog")
 class Config:
     anthropic_key: str
     pixabay_key: str
-    tistory_token: str
-    tistory_blog: str
+    tistory_email: str
+    tistory_password: str
+    tistory_blog_url: str
     model: str
-    visibility: str  # 0: 비공개(초안 용도), 1: 보호, 3: 발행
-    category_id: str
 
 
 def load_config(publish: bool) -> Config:
@@ -65,24 +56,23 @@ def load_config(publish: bool) -> Config:
     cfg = Config(
         anthropic_key=os.getenv("ANTHROPIC_API_KEY", "").strip(),
         pixabay_key=os.getenv("PIXABAY_API_KEY", "").strip(),
-        tistory_token=os.getenv("TISTORY_ACCESS_TOKEN", "").strip(),
-        tistory_blog=os.getenv("TISTORY_BLOG_NAME", "").strip(),
+        tistory_email=os.getenv("TISTORY_EMAIL", "").strip(),
+        tistory_password=os.getenv("TISTORY_PASSWORD", "").strip(),
+        tistory_blog_url=os.getenv("TISTORY_BLOG_URL", "").strip().rstrip("/"),
         model=os.getenv("ANTHROPIC_MODEL", "").strip() or DEFAULT_MODEL,
-        visibility=os.getenv("TISTORY_VISIBILITY", "").strip() or "0",
-        category_id=os.getenv("TISTORY_CATEGORY_ID", "").strip(),
     )
 
     required = {"ANTHROPIC_API_KEY": cfg.anthropic_key, "PIXABAY_API_KEY": cfg.pixabay_key}
     if publish:
-        required["TISTORY_ACCESS_TOKEN"] = cfg.tistory_token
-        required["TISTORY_BLOG_NAME"] = cfg.tistory_blog
+        required["TISTORY_EMAIL"] = cfg.tistory_email
+        required["TISTORY_PASSWORD"] = cfg.tistory_password
+        required["TISTORY_BLOG_URL"] = cfg.tistory_blog_url
+    
     missing = [name for name, value in required.items() if not value]
     if missing:
         raise SystemExit(
             "❌ 환경 변수(또는 .env)에 다음 값이 비어 있습니다: " + ", ".join(missing)
         )
-    if cfg.visibility not in {"0", "1", "3"}:
-        raise SystemExit("❌ TISTORY_VISIBILITY 는 0(비공개), 1(보호), 3(발행) 중 하나여야 합니다.")
     return cfg
 
 
@@ -105,7 +95,6 @@ def generate_random_keyword(client: anthropic.Anthropic, model: str) -> str:
         messages=[{"role": "user", "content": prompt}],
     )
     keyword = "".join(b.text for b in response.content if b.type == "text").strip()
-    # 혹시 따옴표가 포함되어 있다면 제거
     keyword = keyword.strip('"\'')
     log.info("        ✓ 생성된 키워드: %s", keyword)
     return keyword
@@ -227,11 +216,6 @@ class Image:
     user: str
     user_url: str
     page_url: str
-    tistory_url: str = ""
-
-
-def _mask(text: str, secret: str) -> str:
-    return text.replace(secret, "***") if secret else text
 
 
 def fetch_images(cfg: Config, keyword: str, queries: list[str], slug: str) -> list[Image]:
@@ -255,17 +239,15 @@ def fetch_images(cfg: Config, keyword: str, queries: list[str], slug: str) -> li
                 timeout=HTTP_TIMEOUT,
             )
             if resp.status_code != 200:
-                raise RuntimeError(f"Pixabay API 오류 (HTTP {resp.status_code}): {resp.text[:100]!r}")
+                raise RuntimeError(f"Pixabay API 오류 (HTTP {resp.status_code})")
 
             hits = [h for h in resp.json().get("hits", []) if h["id"] not in used_ids]
             if not hits:
-                log.warning("        ! '%s' 검색 결과 없음 → 건너뜀", query)
                 continue
 
             hit = hits[0]
             src = hit.get("largeImageURL") or hit.get("webformatURL")
             if not src:
-                log.warning("        ! '%s' 결과에 이미지 URL 이 없음 → 건너뜀", query)
                 continue
             used_ids.add(hit["id"])
 
@@ -275,50 +257,36 @@ def fetch_images(cfg: Config, keyword: str, queries: list[str], slug: str) -> li
             path = IMAGES_DIR / f"{slug}_{index}{Path(urlparse(src).path).suffix.lower() or '.jpg'}"
             path.write_bytes(img_resp.content)
 
-            user = _clean_alt(hit.get("user") or "Pixabay")
+            user = re.sub(r"[\[\]()]", "", hit.get("user") or "Pixabay").strip()
             user_url = f"https://pixabay.com/users/{quote(user)}-{hit['user_id']}/" if hit.get("user_id") else "https://pixabay.com"
             images.append(
                 Image(
                     placeholder=f"{{{{IMAGE_{index}}}}}",
                     query=query,
-                    alt=_clean_alt(f"{keyword} - {query}"),
+                    alt=re.sub(r"[\[\]()]", "", f"{keyword} - {query}").strip(),
                     local_path=path,
                     user=user,
                     user_url=user_url,
                     page_url=hit.get("pageURL") or "https://pixabay.com",
                 )
             )
-            log.info("        ✓ '%s' → %s (%.0fKB, by %s)", query, path.name, len(img_resp.content) / 1024, user)
-        except (requests.RequestException, RuntimeError, KeyError, ValueError) as exc:
-            log.warning("        ! '%s' 이미지 처리 실패: %s", query, _mask(str(exc), cfg.pixabay_key))
+            log.info("        ✓ '%s' → %s", query, path.name)
+        except Exception as exc:
+            log.warning("        ! '%s' 이미지 처리 실패: %s", query, exc)
     return images
 
 
-def _clean_alt(text: str) -> str:
-    return re.sub(r"[\[\]()]", "", text).strip()
-
-
 # ──────────────────────────────────────────────────────────────
-# 3) 마크다운 조립 및 HTML 변환
+# 3) 마크다운 조립
 # ──────────────────────────────────────────────────────────────
-def insert_images(body_md: str, images: list[Image], for_publish: bool) -> str:
+def insert_images(body_md: str, images: list[Image]) -> str:
     for img in images:
-        if img.tistory_url:
-            url = img.tistory_url
-        elif not for_publish:
-            url = f"../images/{img.local_path.name}"
-        else:
-            log.warning("        ! %s 는 티스토리에 업로드되지 않아 발행 본문에서 제외합니다.", img.local_path.name)
-            continue
-
         block = (
-            f"![{img.alt}]({url})\n\n"
+            f"![{img.alt}]({img.local_path.absolute()})\n\n"
             f"*Image by [{img.user}]({img.user_url}) on [Pixabay]({img.page_url})*"
         )
         if img.placeholder in body_md:
             body_md = body_md.replace(img.placeholder, block)
-        elif not for_publish:
-            log.warning("        ! 본문에 %s 자리표시자가 없어 이미지를 넣지 못했습니다.", img.placeholder)
     body_md = re.sub(r"[ \t]*\{\{IMAGE_\d+\}\}[ \t]*\n?", "", body_md)
     return re.sub(r"\n{3,}", "\n\n", body_md)
 
@@ -342,144 +310,69 @@ def build_markdown_file(keyword: str, post: dict, body_md: str, published_url: s
     return "\n".join(front) + f"\n\n# {post['title']}\n\n{body_md.strip()}\n"
 
 
-_INLINE = re.compile(
-    r"!\[([^\]]*)\]\(([^)\s]+)\)"
-    r"|\[([^\]]+)\]\(([^)\s]+)\)"
-    r"|\*\*(.+?)\*\*"
-    r"|\*(.+?)\*"
-    r"|`([^`]+)`"
-)
-
-
-def _esc(text: str) -> str:
-    return html.escape(text, quote=True)
-
-
-def _inline(text: str) -> str:
-    out, pos = [], 0
-    for m in _INLINE.finditer(text):
-        out.append(_esc(text[pos:m.start()]))
-        if m.group(2) is not None:
-            out.append(f'<img src="{_esc(m.group(2))}" alt="{_esc(m.group(1))}" style="max-width:100%;" />')
-        elif m.group(4) is not None:
-            out.append(f'<a href="{_esc(m.group(4))}" target="_blank" rel="noopener">{_esc(m.group(3))}</a>')
-        elif m.group(5) is not None:
-            out.append(f"<strong>{_inline(m.group(5))}</strong>")
-        elif m.group(6) is not None:
-            out.append(f"<em>{_inline(m.group(6))}</em>")
-        else:
-            out.append(f"<code>{_esc(m.group(7))}</code>")
-        pos = m.end()
-    out.append(_esc(text[pos:]))
-    return "".join(out)
-
-
-def markdown_to_html(md: str) -> str:
-    html_parts: list[str] = []
-    paragraph: list[str] = []
-    list_type: str | None = None
-
-    def flush_paragraph() -> None:
-        if paragraph:
-            html_parts.append(f"<p>{_inline(' '.join(paragraph))}</p>")
-            paragraph.clear()
-
-    def close_list() -> None:
-        nonlocal list_type
-        if list_type:
-            html_parts.append(f"</{list_type}>")
-            list_type = None
-
-    for raw in md.splitlines():
-        line = raw.strip()
-        if not line:
-            flush_paragraph()
-            close_list()
-            continue
-
-        heading = re.match(r"^(#{1,6})\s+(.*)$", line)
-        bullet = re.match(r"^[-*]\s+(.*)$", line)
-        numbered = re.match(r"^\d+[.)]\s+(.*)$", line)
-        quote = re.match(r"^>\s?(.*)$", line)
-
-        if heading:
-            flush_paragraph(); close_list()
-            level = min(len(heading.group(1)) + (1 if len(heading.group(1)) == 1 else 0), 6)
-            html_parts.append(f"<h{level}>{_inline(heading.group(2))}</h{level}>")
-        elif re.match(r"^(-{3,}|\*{3,})$", line):
-            flush_paragraph(); close_list()
-            html_parts.append("<hr />")
-        elif bullet or numbered:
-            flush_paragraph()
-            wanted = "ul" if bullet else "ol"
-            if list_type != wanted:
-                close_list()
-                html_parts.append(f"<{wanted}>")
-                list_type = wanted
-            html_parts.append(f"<li>{_inline((bullet or numbered).group(1))}</li>")
-        elif quote:
-            flush_paragraph(); close_list()
-            html_parts.append(f"<blockquote>{_inline(quote.group(1))}</blockquote>")
-        else:
-            close_list()
-            paragraph.append(line)
-
-    flush_paragraph()
-    close_list()
-    return "\n".join(html_parts)
-
-
 # ──────────────────────────────────────────────────────────────
-# 4) 티스토리 발행
+# 4) Playwright: 티스토리 웹 자동화 발행
 # ──────────────────────────────────────────────────────────────
-TISTORY_HINT = (
-    "티스토리 Open API 는 서비스가 중단되었다는 보고가 있어, 토큰이 맞더라도 호출이 실패할 수 있습니다. "
-    "이 경우 posts/ 의 마크다운은 정상 저장되며, 내용을 티스토리 에디터에 직접 붙여넣어 발행할 수 있습니다."
-)
+def tistory_publish_playwright(cfg: Config, post: dict, body_md: str) -> str:
+    log.info("  [4/4] Playwright로 티스토리 자동 발행 시도 중...")
+    with sync_playwright() as p:
+        # headless=True 로 설정하면 백그라운드에서 실행됨 (디버깅 시 False로 변경 가능)
+        browser = p.chromium.launch(headless=True)
+        context = browser.new_context(viewport={"width": 1280, "height": 800})
+        page = context.new_page()
 
+        try:
+            # 1. 카카오 로그인 페이지 접속
+            page.goto("https://accounts.kakao.com/login?continue=https%3A%2F%2Fwww.tistory.com%2Fauth%2Flogin")
+            
+            # 이메일 / 비밀번호 입력
+            page.fill("input[name='loginId']", cfg.tistory_email)
+            page.fill("input[name='password']", cfg.tistory_password)
+            page.click("button[type='submit']")
+            page.wait_for_load_state("networkidle")
 
-def _tistory_body(resp: requests.Response) -> dict:
-    try:
-        payload = resp.json()
-    except ValueError:
-        raise RuntimeError(f"티스토리 응답이 JSON 이 아닙니다 (HTTP {resp.status_code}): {resp.text[:150]!r}")
-    body = payload.get("tistory", payload)
-    status = str(body.get("status", resp.status_code))
-    if resp.status_code != 200 or status != "200":
-        message = body.get("error_message") or resp.text[:150]
-        raise RuntimeError(f"티스토리 API 오류 (HTTP {resp.status_code}, status={status}): {message}")
-    return body
+            # 2. 티스토리 글쓰기 페이지로 이동
+            write_url = f"{cfg.tistory_blog_url}/manage/newpost"
+            page.goto(write_url)
+            page.wait_for_timeout(3000)
 
+            # 3. 제목 입력
+            page.fill("#post-title-inp", post["title"])
 
-def tistory_upload_image(cfg: Config, path: Path) -> str:
-    with path.open("rb") as fh:
-        resp = requests.post(
-            TISTORY_ATTACH_URL,
-            data={"access_token": cfg.tistory_token, "blogName": cfg.tistory_blog, "output": "json"},
-            files={"uploadedfile": (path.name, fh, mimetypes.guess_type(path.name)[0] or "image/jpeg")},
-            timeout=60,
-        )
-    url = _tistory_body(resp).get("url")
-    if not url:
-        raise RuntimeError("티스토리 이미지 업로드 응답에 url 이 없습니다.")
-    return url
+            # 4. 에디터를 HTML 모드로 전환하여 마크다운 본문 주입
+            # (티스토리 에디터 하단의 기본 모드 -> HTML 모드 버튼 클릭)
+            try:
+                # 에디터 모드 변경 버튼 클릭 시도 (에디터 UI에 따라 다를 수 있음)
+                page.click("button.btn-toggle-mode", timeout=5000)
+                page.wait_for_timeout(1000)
+                # 코드미러 또는 텍스트어레이어에 본문 입력
+                page.fill("div.CodeMirror textarea", body_md)
+            except Exception:
+                # 기본 모드일 경우 클립보드나 자바스크립트로 주입
+                page.evaluate(f"document.querySelector('.CodeMirror textarea').value = {json.dumps(body_md)}")
 
+            # 5. 태그 입력
+            if post["tags"]:
+                tag_input = page.locator("input#tagText")
+                for tag in post["tags"]:
+                    tag_input.fill(tag)
+                    tag_input.press("Enter")
 
-def tistory_publish(cfg: Config, title: str, content_html: str, tags: list[str]) -> str:
-    data = {
-        "access_token": cfg.tistory_token,
-        "output": "json",
-        "blogName": cfg.tistory_blog,
-        "title": title,
-        "content": content_html,
-        "visibility": cfg.visibility,
-        "tag": ",".join(tags),
-    }
-    if cfg.category_id:
-        data["category"] = cfg.category_id
-    resp = requests.post(TISTORY_WRITE_URL, data=data, timeout=HTTP_TIMEOUT)
-    body = _tistory_body(resp)
-    return body.get("url") or f"https://{cfg.tistory_blog}.tistory.com/{body.get('postId', '')}"
+            # 6. 완료/발행 버튼 클릭
+            page.click("button#publish-layer-btn")  # 발행 버튼 열기
+            page.wait_for_timeout(1000)
+            page.click("button#publish-btn")        # 최종 발행 버튼
+            page.wait_for_timeout(5000)
+
+            published_url = page.url
+            log.info("        ✓ Playwright 발행 성공: %s", published_url)
+            browser.close()
+            return published_url
+
+        except Exception as exc:
+            log.error("        ✗ Playwright 발행 실패: %s", exc)
+            browser.close()
+            raise RuntimeError(f"웹 자동화 발행 중 오류 발생: {exc}")
 
 
 # ──────────────────────────────────────────────────────────────
@@ -498,52 +391,30 @@ def save_post(slug: str, content: str) -> Path:
     return path
 
 
-def process_keyword(keyword: str, cfg: Config, client: anthropic.Anthropic, publish: bool, keep_images: bool) -> str:
+def process_keyword(keyword: str, cfg: Config, client: anthropic.Anthropic, publish: bool) -> str:
     slug = slugify(keyword)
-    images: list[Image] = []
+    images = []
     try:
         post = generate_post(client, cfg.model, keyword)
         images = fetch_images(cfg, keyword, post["image_keywords"], slug)
 
-        if publish and images:
-            log.info("  [3/4] 티스토리에 이미지 업로드 중...")
-            for img in images:
-                try:
-                    img.tistory_url = tistory_upload_image(cfg, img.local_path)
-                    log.info("        ✓ %s 업로드 완료", img.local_path.name)
-                except (requests.RequestException, RuntimeError) as exc:
-                    log.warning("        ! %s 업로드 실패: %s", img.local_path.name, exc)
-        else:
-            log.info("  [3/4] 이미지 업로드 생략")
+        body_md = insert_images(post["body_markdown"], images)
 
         published_url = ""
         if publish:
-            log.info("  [4/4] 티스토리 발행 중... (visibility=%s)", cfg.visibility)
-            try:
-                publish_md = insert_images(post["body_markdown"], images, for_publish=True)
-                published_url = tistory_publish(cfg, post["title"], markdown_to_html(publish_md), post["tags"])
-                log.info("        ✓ 발행 성공: %s", published_url)
-            except (requests.RequestException, RuntimeError) as exc:
-                log.error("        ✗ 티스토리 발행 실패: %s", exc)
-                log.error("          %s", TISTORY_HINT)
-        else:
-            log.info("  [4/4] 티스토리 발행 생략 (--no-publish)")
+            published_url = tistory_publish_playwright(cfg, post, body_md)
 
-        body_md = insert_images(post["body_markdown"], images, for_publish=False)
         saved_path = save_post(slug, build_markdown_file(keyword, post, body_md, published_url))
         log.info("  💾 마크다운 저장: %s", saved_path.relative_to(BASE_DIR))
         return "published" if published_url else "saved"
     finally:
-        if not keep_images:
-            for img in images:
-                if img.tistory_url:
-                    img.local_path.unlink(missing_ok=True)
+        pass
 
 
 # ──────────────────────────────────────────────────────────────
-# 자동화 작업 실행 함수 (스케줄러 연동용)
+# 자동화 작업 실행 함수
 # ──────────────────────────────────────────────────────────────
-def run_job(no_publish: bool = False, keep_images: bool = False, limit: int = 1) -> None:
+def run_job(no_publish: bool = False, limit: int = 1) -> None:
     log.info("🔄 예약된 블로그 자동화 작업 루프 시작")
     try:
         publish = not no_publish
@@ -553,26 +424,13 @@ def run_job(no_publish: bool = False, keep_images: bool = False, limit: int = 1)
         IMAGES_DIR.mkdir(exist_ok=True)
         client = anthropic.Anthropic(api_key=cfg.anthropic_key)
         
-        log.info("AI 키워드 자동 생성 및 포스팅 발행 시작 (지정 횟수: %d개)", limit)
-
         results = {"published": 0, "saved": 0, "failed": 0}
         for i in range(1, limit + 1):
             log.info("━━ [실행 %d/%d]", i, limit)
             try:
-                # 실행될 때마다 AI가 새로운 여행지 키워드 생성
                 keyword = generate_random_keyword(client, cfg.model)
-                
-                status = process_keyword(keyword, cfg, client, publish, keep_images)
+                status = process_keyword(keyword, cfg, client, publish)
                 results[status] += 1
-            except KeyboardInterrupt:
-                log.warning("사용자 중단")
-                break
-            except anthropic.APIStatusError as exc:
-                results["failed"] += 1
-                log.error("  ✗ Anthropic API 오류 (HTTP %s): %s", exc.status_code, exc.message)
-            except anthropic.APIConnectionError as exc:
-                results["failed"] += 1
-                log.error("  ✗ Anthropic 연결 실패: %s", exc)
             except Exception as exc:
                 results["failed"] += 1
                 log.error("  ✗ 처리 실패 (%s): %s", type(exc).__name__, exc)
@@ -580,22 +438,18 @@ def run_job(no_publish: bool = False, keep_images: bool = False, limit: int = 1)
             if i < limit:
                 time.sleep(3.0)
 
-        log.info(
-            "작업 완료 — 발행 %d / 마크다운만 저장 %d / 실패 %d",
-            results["published"], results["saved"], results["failed"],
-        )
+        log.info("작업 완료 — 발행 %d / 저장 %d / 실패 %d", results["published"], results["saved"], results["failed"])
     except Exception as exc:
-        log.error("✗ 작업 실행 중 치명적 오류 발생: %s", exc)
+    log.error("✗ 작업 실행 중 치명적 오류 발생: %s", exc)
 
 
 # ──────────────────────────────────────────────────────────────
 # 엔트리포인트
 # ──────────────────────────────────────────────────────────────
 def parse_args(argv: list[str] | None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="해외 여행지 블로그 포스팅 자동화 (AI 키워드 자동 생성)")
-    parser.add_argument("--once", action="store_true", help="스케줄러 대기 없이 즉시 1회 실행 후 종료")
-    parser.add_argument("--no-publish", action="store_true", help="티스토리 발행 없이 마크다운만 저장")
-    parser.add_argument("--keep-images", action="store_true", help="티스토리에 업로드한 이미지도 삭제하지 않음")
+    parser = argparse.ArgumentParser(description="해외 여행지 블로그 포스팅 자동화 (Playwright 버전)")
+    parser.add_argument("--once", action="store_true", help="1회만 즉시 실행 후 종료")
+    parser.add_argument("--no-publish", action="store_true", help="발행 없이 마크다운만 저장")
     parser.add_argument("--limit", type=int, default=1, help="한 번 실행 시 생성할 포스팅 개수")
     parser.add_argument("-v", "--verbose", action="store_true", help="디버그 로그 출력")
     return parser.parse_args(argv)
@@ -613,25 +467,20 @@ def main(argv: list[str] | None = None) -> int:
         format="%(asctime)s [%(levelname)s] %(message)s",
         datefmt="%H:%M:%S",
     )
-    logging.getLogger("httpx").setLevel(logging.WARNING)
 
     if args.once:
-        run_job(args.no_publish, args.keep_images, args.limit)
+        run_job(args.no_publish, args.limit)
         return 0
 
-    # 24시간 백그라운드 서버 모드 (스케줄러 설정)
-    schedule.every().day.at("09:00").do(run_job, no_publish=args.no_publish, keep_images=args.keep_images, limit=args.limit)
-    schedule.every().day.at("21:00").do(run_job, no_publish=args.no_publish, keep_images=args.keep_images, limit=args.limit)
+    schedule.every().day.at("09:00").do(run_job, no_publish=args.no_publish, limit=args.limit)
+    schedule.every().day.at("21:00").do(run_job, no_publish=args.no_publish, limit=args.limit)
 
-    log.info("🤖 AI 자동 키워드 블로그 스케줄러가 시작되었습니다. (매일 09:00, 21:00 자동 실행 대기 중)")
-    log.info("   (즉시 1회 테스트하려면 'python main.py --once' 명령어를 사용하세요)")
-
+    log.info("🤖 Playwright 웹 자동화 블로그 스케줄러가 시작되었습니다.")
     while True:
         try:
             schedule.run_pending()
             time.sleep(60)
         except KeyboardInterrupt:
-            log.info("사용자에 의해 스케줄러가 종료되었습니다.")
             break
 
     return 0
