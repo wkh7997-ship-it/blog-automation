@@ -440,7 +440,7 @@ def run_job(no_publish: bool = False, limit: int = 1) -> None:
 
         log.info("작업 완료 — 발행 %d / 저장 %d / 실패 %d", results["published"], results["saved"], results["failed"])
     except Exception as exc:
-    log.error("✗ 작업 실행 중 치명적 오류 발생: %s", exc)
+        log.error("✗ 작업 실행 중 치명적 오류 발생: %s", exc)  # 들여쓰기 4칸 적용
 
 
 # ──────────────────────────────────────────────────────────────
