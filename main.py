@@ -330,11 +330,14 @@ def tistory_publish_playwright(cfg: Config, post: dict, body_md: str) -> str:
             page.fill("input[name='password']", cfg.tistory_password)
             page.click("button[type='submit']")
             page.wait_for_load_state("networkidle")
-
+            
             # 2. 티스토리 글쓰기 페이지로 이동
             write_url = f"{cfg.tistory_blog_url}/manage/newpost"
             page.goto(write_url)
-            page.wait_for_timeout(3000)
+            
+            # 페이지가 완전히 로드될 때까지 최대 10초 대기
+            page.wait_for_load_state("load")
+            page.wait_for_selector("#post-title-inp", timeout=10000)
 
             # 3. 제목 입력
             page.fill("#post-title-inp", post["title"])
