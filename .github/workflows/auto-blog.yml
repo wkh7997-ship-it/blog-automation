@@ -2,8 +2,10 @@ name: Tistory Auto Blog
 
 on:
   schedule:
-    - cron: '0 0 * * *' # 매일 UTC 기준 0시 (한국 시간 오전 9시)에 자동 실행
-  workflow_dispatch: # 깃허브 웹에서 버튼을 눌러 수동으로 즉시 실행할 수도 있습니다.
+    # 한국 시간 기준 오전 9시(0 0) 및 저녁 9시(0 12) 매일 2회 실행
+    - cron: '0 0 * * *'
+    - cron: '0 12 * * *'
+  workflow_dispatch:
 
 jobs:
   run-blog:
@@ -29,4 +31,4 @@ jobs:
           TISTORY_ACCESS_TOKEN: ${{ secrets.TISTORY_ACCESS_TOKEN }}
           TISTORY_BLOG_NAME: ${{ secrets.TISTORY_BLOG_NAME }}
         run: |
-          python main.py --once
+          python main.py --limit 1
