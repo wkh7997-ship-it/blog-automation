@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""해외 여행지 블로그 포스팅 자동화 (Render / 백그라운드 스케줄러 버전)
+"""해외 여행지 블로그 포스팅 자동화 (AI 키워드 자동 생성 버전)
 
-keywords.txt → Claude(포스팅 생성) → Pixabay(이미지) → posts/*.md 저장 → 티스토리 발행
+Claude(키워드 자동 생성 + 포스팅 작성) → Pixabay(이미지) → posts/*.md 저장 → 티스토리 발행
 
 사용법 (로컬 테스트 시):
     python main.py             # 상시 대기하며 스케줄에 따라 실행
     python main.py --once      # 1회만 즉시 실행 후 종료
-    python main.py --no-publish    # 마크다운 저장만 (티스토리 발행 생략)
+    python main.py --no-publish    # 마크다운만 저장 (티스토리 발행 생략)
 """
 from __future__ import annotations
 
@@ -35,7 +35,6 @@ import schedule
 BASE_DIR = Path(__file__).resolve().parent
 POSTS_DIR = BASE_DIR / "posts"
 IMAGES_DIR = BASE_DIR / "images"
-KEYWORDS_FILE = BASE_DIR / "keywords.txt"
 
 DEFAULT_MODEL = "claude-sonnet-5-5"
 
@@ -43,9 +42,6 @@ PIXABAY_API_URL = "https://pixabay.com/api/"
 TISTORY_WRITE_URL = "https://www.tistory.com/apis/post/write"
 TISTORY_ATTACH_URL = "https://www.tistory.com/apis/post/attach"
 HTTP_TIMEOUT = 30
-
-DONE_PREFIX = "[완료]"
-SAVED_PREFIX = "[저장]"
 
 log = logging.getLogger("travel-blog")
 
@@ -91,35 +87,30 @@ def load_config(publish: bool) -> Config:
 
 
 # ──────────────────────────────────────────────────────────────
-# keywords.txt 처리
+# 1) Claude: 키워드 자동 생성 및 포스팅 생성
 # ──────────────────────────────────────────────────────────────
-def read_pending_keywords() -> list[str]:
-    if not KEYWORDS_FILE.exists():
-        # 파일이 없으면 기본 예시 키워드 생성
-        KEYWORDS_FILE.write_text("# 여기에 키워드를 입력하세요\n오사카 맛집 지도\n방콕 가성비 여행 팁\n", encoding="utf-8")
-    pending = []
-    for line in KEYWORDS_FILE.read_text(encoding="utf-8-sig").splitlines():
-        stripped = line.strip()
-        if not stripped or stripped.startswith(("#", "[")):
-            continue
-        pending.append(stripped)
-    return pending
+def generate_random_keyword(client: anthropic.Anthropic, model: str) -> str:
+    log.info("  [0/4] AI가 무작위 여행지/맛집 키워드를 생성하는 중...")
+    prompt = """
+    전 세계의 인기 있거나 매력적인 여행지, 관광명소, 맛집, 도시 관련 블로그 포스팅 키워드를 딱 1개만 생성해줘.
+    유럽, 아시아, 미주, 남미, 오세아니아, 국내 등 다양한 지역을 골고루 포함해줘.
+    
+    [응답 조건]
+    - 오직 키워드 단어 또는 문구만 출력할 것 (예: "파리 3박 4일 추천 코스", "다낭 가성비 해산물 맛집 모음", "바르셀로나 가볼 만한 곳 TOP 5")
+    - 따옴표, 불필요한 설명, 인사말 절대 금지
+    """
+    response = client.messages.create(
+        model=model,
+        max_tokens=100,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    keyword = "".join(b.text for b in response.content if b.type == "text").strip()
+    # 혹시 따옴표가 포함되어 있다면 제거
+    keyword = keyword.strip('"\'')
+    log.info("        ✓ 생성된 키워드: %s", keyword)
+    return keyword
 
 
-def mark_keyword(keyword: str, prefix: str) -> None:
-    if not KEYWORDS_FILE.exists():
-        return
-    lines = KEYWORDS_FILE.read_text(encoding="utf-8-sig").splitlines()
-    for i, line in enumerate(lines):
-        if line.strip() == keyword:
-            lines[i] = f"{prefix} {keyword}"
-            break
-    KEYWORDS_FILE.write_text("\n".join(lines) + "\n", encoding="utf-8")
-
-
-# ──────────────────────────────────────────────────────────────
-# 1) Claude: 포스팅 생성
-# ──────────────────────────────────────────────────────────────
 SYSTEM_PROMPT = """\
 당신은 해외 여행 전문 블로거이자 SEO 에디터입니다. 한국어 독자를 위해 검색 노출에 유리하고 \
 실제로 도움이 되는 여행 포스팅을 작성합니다.
@@ -552,28 +543,27 @@ def process_keyword(keyword: str, cfg: Config, client: anthropic.Anthropic, publ
 # ──────────────────────────────────────────────────────────────
 # 자동화 작업 실행 함수 (스케줄러 연동용)
 # ──────────────────────────────────────────────────────────────
-def run_job(no_publish: bool = False, keep_images: bool = False) -> None:
+def run_job(no_publish: bool = False, keep_images: bool = False, limit: int = 1) -> None:
     log.info("🔄 예약된 블로그 자동화 작업 루프 시작")
     try:
         publish = not no_publish
         cfg = load_config(publish)
-        keywords = read_pending_keywords()
-        if not keywords:
-            log.info("처리할 대기 중인 키워드가 없습니다. keywords.txt 를 확인하세요.")
-            return
-
+        
         POSTS_DIR.mkdir(exist_ok=True)
         IMAGES_DIR.mkdir(exist_ok=True)
         client = anthropic.Anthropic(api_key=cfg.anthropic_key)
-        log.info("총 %d개 키워드 처리 시작 (발행: %s)", len(keywords), "ON" if publish else "OFF")
+        
+        log.info("AI 키워드 자동 생성 및 포스팅 발행 시작 (지정 횟수: %d개)", limit)
 
         results = {"published": 0, "saved": 0, "failed": 0}
-        for i, keyword in enumerate(keywords, start=1):
-            log.info("━━ [%d/%d] %s", i, len(keywords), keyword)
+        for i in range(1, limit + 1):
+            log.info("━━ [실행 %d/%d]", i, limit)
             try:
+                # 실행될 때마다 AI가 새로운 여행지 키워드 생성
+                keyword = generate_random_keyword(client, cfg.model)
+                
                 status = process_keyword(keyword, cfg, client, publish, keep_images)
                 results[status] += 1
-                mark_keyword(keyword, DONE_PREFIX if status == "published" else SAVED_PREFIX)
             except KeyboardInterrupt:
                 log.warning("사용자 중단")
                 break
@@ -587,7 +577,7 @@ def run_job(no_publish: bool = False, keep_images: bool = False) -> None:
                 results["failed"] += 1
                 log.error("  ✗ 처리 실패 (%s): %s", type(exc).__name__, exc)
 
-            if i < len(keywords):
+            if i < limit:
                 time.sleep(3.0)
 
         log.info(
@@ -602,10 +592,11 @@ def run_job(no_publish: bool = False, keep_images: bool = False) -> None:
 # 엔트리포인트
 # ──────────────────────────────────────────────────────────────
 def parse_args(argv: list[str] | None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="해외 여행지 블로그 포스팅 자동화 (Render 스케줄러 지원)")
+    parser = argparse.ArgumentParser(description="해외 여행지 블로그 포스팅 자동화 (AI 키워드 자동 생성)")
     parser.add_argument("--once", action="store_true", help="스케줄러 대기 없이 즉시 1회 실행 후 종료")
     parser.add_argument("--no-publish", action="store_true", help="티스토리 발행 없이 마크다운만 저장")
     parser.add_argument("--keep-images", action="store_true", help="티스토리에 업로드한 이미지도 삭제하지 않음")
+    parser.add_argument("--limit", type=int, default=1, help="한 번 실행 시 생성할 포스팅 개수")
     parser.add_argument("-v", "--verbose", action="store_true", help="디버그 로그 출력")
     return parser.parse_args(argv)
 
@@ -624,19 +615,15 @@ def main(argv: list[str] | None = None) -> int:
     )
     logging.getLogger("httpx").setLevel(logging.WARNING)
 
-    # --once 옵션이 켜져 있거나 Render 환경 등에서 즉시 실행이 필요할 때
     if args.once:
-        run_job(args.no_publish, args.keep_images)
+        run_job(args.no_publish, args.keep_images, args.limit)
         return 0
 
     # 24시간 백그라운드 서버 모드 (스케줄러 설정)
-    # 예: 매일 아침 9시 (또는 원하시는 시간으로 변경 가능)에 자동 실행
-    schedule.every().day.at("09:00").do(run_job, no_publish=args.no_publish, keep_images=args.keep_images)
-    
-    # 테스트를 원하시면 아래처럼 매 N시간 또는 매 분 단위로 바꿀 수도 있습니다:
-    # schedule.every(3).hours.do(run_job, no_publish=args.no_publish, keep_images=args.keep_images)
+    schedule.every().day.at("09:00").do(run_job, no_publish=args.no_publish, keep_images=args.keep_images, limit=args.limit)
+    schedule.every().day.at("21:00").do(run_job, no_publish=args.no_publish, keep_images=args.keep_images, limit=args.limit)
 
-    log.info("🤖 Render 백그라운드 스케줄러가 시작되었습니다. (매일 09:00 자동 실행 대기 중)")
+    log.info("🤖 AI 자동 키워드 블로그 스케줄러가 시작되었습니다. (매일 09:00, 21:00 자동 실행 대기 중)")
     log.info("   (즉시 1회 테스트하려면 'python main.py --once' 명령어를 사용하세요)")
 
     while True:
